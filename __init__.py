@@ -35,17 +35,58 @@ current_device = mm.get_torch_device()
 current_text_encoder_device = mm.text_encoder_device()
 model_allocation_store = {}
 
+# def get_torch_device_patched():
+#     device = None
+#     if (not torch.cuda.is_available() or not torch.xpu.is_available() or mm.cpu_state == mm.CPUState.CPU or "cpu" in str(current_device).lower()):
+#         device = torch.device("cpu")
+#     else:
+#         device = torch.device(current_device)
+#     return device
+# 
 def get_torch_device_patched():
     device = None
-    if (not torch.cuda.is_available() or mm.cpu_state == mm.CPUState.CPU or "cpu" in str(current_device).lower()):
+    use_cpu = False
+    if mm.cpu_state == mm.CPUState.CPU or "cpu" in str(current_device).lower():
+        use_cpu = True
+    else:
+        try:
+            requested_device = torch.device(current_device)
+            if requested_device.type != 'cuda' and requested_device.type != 'xpu':
+                print(f"Warning: Requested device (current_device) is not CUDA or XPU type. Falling back to CPU.")
+                use_cpu = True
+        except Exception as e:
+            print(f"Warning: Failed to parse or use device (current_device). Falling back to CPU Error: {e}")
+            use_cpu = True
+            
+    if use_cpu:
         device = torch.device("cpu")
     else:
         device = torch.device(current_device)
     return device
 
+# def text_encoder_device_patched():
+#     device = None
+#     if (not torch.cuda.is_available() or not torch.xpu.is_available() or mm.cpu_state == mm.CPUState.CPU or "cpu" in str(current_text_encoder_device).lower()):
+#         device = torch.device("cpu")
+#     else:
+#         device = torch.device(current_text_encoder_device)
+#     return device
+
 def text_encoder_device_patched():
     device = None
-    if (not torch.cuda.is_available() or mm.cpu_state == mm.CPUState.CPU or "cpu" in str(current_text_encoder_device).lower()):
+    use_cpu = False
+    if mm.cpu_state == mm.CPUState.CPU or "cpu" in str(current_text_encoder_device).lower():
+        use_cpu = True
+    else:
+        try:
+            requested_device = torch.device(current_text_encoder_device)
+            if requested_device.type != 'cuda' and requested_device.type != 'xpu':
+                print(f"Warning: Requested device (current_text_encoder_device) is not CUDA or XPU type. Falling back to CPU.")
+                use_cpu = True
+        except Exception as e:
+            print(f"Warning: Failed to parse or use device (current_text_encoder_device). Falling back to CPU Error: {e}")
+            use_cpu = True
+    if use_cpu:
         device = torch.device("cpu")
     else:
         device = torch.device(current_text_encoder_device)
@@ -325,7 +366,7 @@ def calculate_vvram_allocation_string(model, virtual_vram_str):
 
 def get_device_list():
     import torch
-    return ["cpu"] + [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+    return ["cpu"] + [f"cuda:{i}" for i in range(torch.cuda.device_count())] + [f"xpu:{i}" for i in range(torch.xpu.device_count())]
 
 class DeviceSelectorMultiGPU:
     @classmethod
@@ -409,7 +450,15 @@ class MergeFluxLoRAsQuantizeAndLoad:
     FUNCTION = "load_and_quantize"
     CATEGORY = "loaders"
 
-    def merge_flux_loras(self, model_sd: dict, lora_paths: list, weights: list, device="cuda") -> dict:
+    def merge_flux_loras(self, model_sd: dict, lora_paths: list, weights: list, device="None") -> dict:
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                device = "xpu"
+            else:
+                device = "cpu"
+
         for lora_path, weight in zip(lora_paths, weights):
             logging.info(f"[DEBUG] Merging LoRA file: {lora_path} with weight: {weight}")
             lora_sd = load_file(lora_path, device=device)
@@ -443,7 +492,10 @@ class MergeFluxLoRAsQuantizeAndLoad:
                 logging.info(f"[DEBUG] Updated module: {module_name}")
                 del up_weight, down_weight, update
             del lora_sd
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif torch.xpu.is_available():
+                torch.xpu.empty_cache()
         return model_sd
 
     def convert_to_gguf(self, model_path, working_dir):
@@ -475,7 +527,15 @@ class MergeFluxLoRAsQuantizeAndLoad:
                     logging.info(f"[DEBUG] Slot {i} is inactive")
             logging.info(f"[DEBUG] Total active LoRAs: {len(lora_list)}")
             if lora_list:
-                model_sd = load_file(model_path, device="cuda")
+                device = None
+                if torch.cuda.is_available():
+                    device = "cuda"
+               	elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                    device = "xpu"
+                else:
+                    device = "cpu"
+
+                model_sd = load_file(model_path, device=device)
                 model_sd = self.merge_flux_loras(
                     model_sd,
                     [lp for lp, _ in lora_list],
@@ -483,7 +543,10 @@ class MergeFluxLoRAsQuantizeAndLoad:
                 )
                 save_file(model_sd, merged_model_path)
                 del model_sd
-                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif torch.xpu.is_available():
+                    torch.xpu.empty_cache()
             else:
                 shutil.copy2(model_path, merged_model_path)
             initial_gguf = self.convert_to_gguf(merged_model_path, merge_dir)
@@ -593,7 +656,10 @@ def override_class_with_distorch(cls):
             vram_string = ""
             if virtual_vram_gb > 0:
                 if use_other_vram:
-                    available_devices = [d for d in get_device_list() if d.startswith('cuda')]
+                    available_devices = [
+                            d for d in get_device_list()
+                            if d.split(':')[0] in ("cuda", "xpu")
+                    ]
                     other_devices = [d for d in available_devices if d != device]
                     other_devices.sort(key=lambda x: int(x.split(':')[1] if ':' in x else x[-1]), reverse=False)
                     device_string = ','.join(other_devices + ['cpu'])
@@ -649,7 +715,10 @@ def override_class_with_distorch_clip(cls):
             vram_string = ""
             if virtual_vram_gb > 0:
                 if use_other_vram:
-                    available_devices = [d for d in get_device_list() if d.startswith('cuda')]
+                    available_devices = [
+                            d for d in get_device_list()
+                            if d.split(':')[0] in ("cuda", "xpu")
+                    ]
                     other_devices = [d for d in available_devices if d != device]
                     other_devices.sort(key=lambda x: int(x.split(':')[1] if ':' in x else x[-1]), reverse=False)
                     device_string = ','.join(other_devices + ['cpu'])
